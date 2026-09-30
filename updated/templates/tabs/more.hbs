@@ -1,0 +1,242 @@
+<section class="{{tab.cssClass}}" data-tab="{{tab.id}}" data-group="{{tab.group}}">
+  {{#if section}}
+  {{#if (eq section.id "actions")}}{{> pocket5e.sectionActions}}{{/if}}
+  {{#if (eq section.id "biography")}}{{> pocket5e.sectionBiography}}{{/if}}
+  {{#if (eq section.id "journal")}}{{> pocket5e.sectionJournal}}{{/if}}
+  {{#if (eq section.id "effects")}}{{> pocket5e.sectionEffects}}{{/if}}
+  {{#if (eq section.id "movement")}}
+  <div class="pocket5e-card pocket5e-movement{{#unless minimapEnabled}} no-minimap{{/unless}}">
+    <div class="pocket5e-movement-head">
+    <h2>{{localize "POCKET5E.More.Movement"}}</h2>
+    <div class="pocket5e-minimap-toggle">
+      <i class="fa-solid fa-map" aria-hidden="true"></i>
+      <button type="button" class="pocket5e-switch{{#if minimapEnabled}} on{{/if}}" role="switch" aria-checked="{{minimapEnabled}}" aria-label="{{localize 'POCKET5E.Movement.MapToggle'}}" title="{{localize 'POCKET5E.Movement.MapToggle'}}" data-action="toggleMinimap"><span class="pocket5e-switch-thumb"></span></button>
+    </div>
+    </div>
+    {{#if minimapEnabled}}
+    <div class="pocket5e-minimap" data-minimap role="group" aria-label="{{localize 'POCKET5E.Movement.MapLabel'}}">
+      {{#if movementMap.available}}
+      
+      {{#if movementMap.hasPlayer}}
+      <div class="pocket5e-minimap-frame{{#if movementMap.sceneBackground}}{{#if movementMap.hasSceneArtwork}} has-scene{{else if movementMap.sceneBackdrop}} has-scene{{/if}}{{/if}}">
+      {{#if movementMap.hasVision}}
+      <svg class="pocket5e-minimap-defs-svg" style="position: absolute; width: 0; height: 0; pointer-events: none;" aria-hidden="true">
+        <defs>
+          <filter id="pocket5e-light-blur" x="-30%" y="-30%" width="160%" height="160%">
+            <feGaussianBlur in="SourceGraphic" stdDeviation="0.12" />
+          </filter>
+          <mask id="pocket5e-light-mask">
+            <rect x="-1" y="-1" width="9" height="9" fill="#000000" />
+            <g filter="url(#pocket5e-light-blur)">
+              {{#each movementMap.lightSources}}
+              {{#if polygonString}}
+              <polygon points="{{polygonString}}" fill="#ffffff" />
+              {{else}}
+              <circle cx="{{cx}}" cy="{{cy}}" r="{{radius}}" fill="#ffffff" />
+              {{/if}}
+              {{/each}}
+            </g>
+          </mask>
+          <clipPath id="pocket5e-light-clip" clipPathUnits="objectBoundingBox">
+            {{#each movementMap.lightSources}}
+            {{#if clipPolygonString}}
+            <polygon points="{{clipPolygonString}}" />
+            {{else}}
+            <circle cx="{{cxNorm}}" cy="{{cyNorm}}" r="{{rNorm}}" />
+            {{/if}}
+            {{/each}}
+          </clipPath>
+        </defs>
+      </svg>
+      {{/if}}
+      {{#if movementMap.sceneBackground}}
+      {{#if movementMap.hasSceneArtwork}}
+      <!-- Base map: grayscale under darkvision in darkness, full color in daylight -->
+      <div class="pocket5e-minimap-scene {{#if movementMap.isDarkness}}is-darkness{{/if}}" aria-hidden="true" style="{{#if movementMap.sceneBackdrop}}--scene-x: {{movementMap.sceneBackdrop.x}}; --scene-y: {{movementMap.sceneBackdrop.y}}; --scene-w: {{movementMap.sceneBackdrop.cols}}; --scene-h: {{movementMap.sceneBackdrop.rows}}; {{/if}}--origin-x: {{movementMap.originX}}; --origin-y: {{movementMap.originY}};">
+        {{#if movementMap.sceneBackdrop}}
+        <img class="pocket5e-minimap-backdrop" src="{{movementMap.sceneBackdrop.src}}" alt="">
+        {{/if}}
+        {{#each movementMap.sceneTiles}}
+        <img class="pocket5e-minimap-tile" src="{{src}}" style="--tile-x: {{x}}; --tile-y: {{y}}; --tile-w: {{cols}}; --tile-h: {{rows}}; --tile-rot: {{rotation}}deg; --tile-anchor-x: {{anchorX}}; --tile-anchor-y: {{anchorY}}; --tile-scale-x: {{scaleX}}; --tile-scale-y: {{scaleY}}; opacity: {{alpha}}; z-index: {{zIndex}};" alt="">
+        {{/each}}
+      </div>
+      <!-- Full color map revealed ONLY where light sources shine -->
+      {{#if movementMap.isDarkness}}
+      {{#if movementMap.lightSources.length}}
+      <div class="pocket5e-minimap-scene is-lit-color" aria-hidden="true" style="{{#if movementMap.sceneBackdrop}}--scene-x: {{movementMap.sceneBackdrop.x}}; --scene-y: {{movementMap.sceneBackdrop.y}}; --scene-w: {{movementMap.sceneBackdrop.cols}}; --scene-h: {{movementMap.sceneBackdrop.rows}}; {{/if}}--origin-x: {{movementMap.originX}}; --origin-y: {{movementMap.originY}};{{#if movementMap.litMaskImage}} -webkit-mask-image: {{movementMap.litMaskImage}}; mask-image: {{movementMap.litMaskImage}}; -webkit-mask-composite: source-over; mask-composite: add;{{/if}}">
+        {{#if movementMap.sceneBackdrop}}
+        <img class="pocket5e-minimap-backdrop" src="{{movementMap.sceneBackdrop.src}}" alt="">
+        {{/if}}
+        {{#each movementMap.sceneTiles}}
+        <img class="pocket5e-minimap-tile" src="{{src}}" style="--tile-x: {{x}}; --tile-y: {{y}}; --tile-w: {{cols}}; --tile-h: {{rows}}; --tile-rot: {{rotation}}deg; --tile-anchor-x: {{anchorX}}; --tile-anchor-y: {{anchorY}}; --tile-scale-x: {{scaleX}}; --tile-scale-y: {{scaleY}}; opacity: {{alpha}}; z-index: {{zIndex}};" alt="">
+        {{/each}}
+      </div>
+      {{/if}}
+      {{/if}}
+      {{else if movementMap.sceneBackdrop}}
+      <div class="pocket5e-minimap-scene {{#if movementMap.isDarkness}}is-darkness{{/if}}" aria-hidden="true" style="--scene-x: {{movementMap.sceneBackdrop.x}}; --scene-y: {{movementMap.sceneBackdrop.y}}; --scene-w: {{movementMap.sceneBackdrop.cols}}; --scene-h: {{movementMap.sceneBackdrop.rows}}; --origin-x: {{movementMap.originX}}; --origin-y: {{movementMap.originY}};">
+        <img src="{{movementMap.sceneBackdrop.src}}" alt="">
+      </div>
+      {{#if movementMap.isDarkness}}
+      {{#if movementMap.lightSources.length}}
+      <div class="pocket5e-minimap-scene is-lit-color" aria-hidden="true" style="--scene-x: {{movementMap.sceneBackdrop.x}}; --scene-y: {{movementMap.sceneBackdrop.y}}; --scene-w: {{movementMap.sceneBackdrop.cols}}; --scene-h: {{movementMap.sceneBackdrop.rows}}; --origin-x: {{movementMap.originX}}; --origin-y: {{movementMap.originY}};{{#if movementMap.litMaskImage}} -webkit-mask-image: {{movementMap.litMaskImage}}; mask-image: {{movementMap.litMaskImage}}; -webkit-mask-composite: source-over; mask-composite: add;{{/if}}">
+        <img src="{{movementMap.sceneBackdrop.src}}" alt="">
+      </div>
+      {{/if}}
+      {{/if}}
+      {{/if}}
+      {{/if}}
+
+      <!-- Animated Light Sources Layer (Torch flicker, Pulse, Chroma, etc.) -->
+      {{#if movementMap.lightSources.length}}
+      <div class="pocket5e-minimap-lights-layer" aria-hidden="true">
+        {{#each movementMap.lightSources}}
+        <div class="pocket5e-minimap-light {{animationClass}}"
+             style="left: {{leftPct}}%; top: {{topPct}}%; width: {{diameterPct}}%; height: {{diameterPct}}%; --light-color: {{color}}; --light-alpha: {{alpha}};">
+        </div>
+        {{/each}}
+      </div>
+      {{/if}}
+      {{#unless movementMap.sceneBackground}}
+      {{#if movementMap.wallSegments.length}}
+      <svg class="pocket5e-minimap-walls-svg" viewBox="0 0 7 7" preserveAspectRatio="none" aria-hidden="true">
+        {{#each movementMap.wallSegments}}
+        <line class="pocket5e-svg-wall {{kind}}" x1="{{x1}}" y1="{{y1}}" x2="{{x2}}" y2="{{y2}}" />
+        {{#if isDoor}}
+        <circle class="pocket5e-svg-door-marker {{kind}}" cx="{{midX}}" cy="{{midY}}" r="0.16" />
+        {{/if}}
+        {{/each}}
+      </svg>
+      {{/if}}
+      {{/unless}}
+
+      {{#if movementMap.hasVision}}
+      <svg class="pocket5e-minimap-fog-svg" viewBox="0 0 7 7" preserveAspectRatio="none" aria-hidden="true">
+        <defs>
+          <filter id="pocket5e-foundry-fog" x="-30%" y="-30%" width="160%" height="160%">
+            <feGaussianBlur in="SourceGraphic" stdDeviation="0.09" />
+          </filter>
+
+          <mask id="pocket5e-fog-mask">
+            <!-- Full white backdrop = 100% opaque darkness everywhere -->
+            <rect x="-1" y="-1" width="9" height="9" fill="#ffffff" />
+
+            <g filter="url(#pocket5e-foundry-fog)">
+              {{#if movementMap.isGlobalLit}}
+                <!-- Global Daylight: entire LOS polygon is visible in black -->
+                {{#if movementMap.sightPolygonString}}
+                <polygon points="{{movementMap.sightPolygonString}}" fill="#000000" />
+                {{else}}
+                <rect x="-1" y="-1" width="9" height="9" fill="#000000" />
+                {{/if}}
+              {{else}}
+                <!-- Darkness: Only smooth circular Darkvision OR Light sources cut through fog -->
+                {{#if movementMap.hasDarkvision}}
+                {{#if movementMap.darkvisionPolygonString}}
+                <polygon points="{{movementMap.darkvisionPolygonString}}" fill="#000000" />
+                {{else}}
+                <circle cx="3.5" cy="3.5" r="{{movementMap.darkvisionRadius}}" fill="#000000" />
+                {{/if}}
+                {{/if}}
+
+                {{#each movementMap.lightSources}}
+                {{#if polygonString}}
+                <polygon points="{{polygonString}}" fill="#000000" />
+                {{else}}
+                <circle cx="{{cx}}" cy="{{cy}}" r="{{radius}}" fill="#000000" />
+                {{/if}}
+                {{/each}}
+              {{/if}}
+            </g>
+          </mask>
+
+          <!-- Light mask: cuts out ONLY areas covered by light sources for full color map rendering -->
+          <mask id="pocket5e-light-mask">
+            <rect x="-1" y="-1" width="9" height="9" fill="#000000" />
+            <g filter="url(#pocket5e-foundry-fog)">
+              {{#each movementMap.lightSources}}
+              {{#if polygonString}}
+              <polygon points="{{polygonString}}" fill="#ffffff" />
+              {{else}}
+              <circle cx="{{cx}}" cy="{{cy}}" r="{{radius}}" fill="#ffffff" />
+              {{/if}}
+              {{/each}}
+            </g>
+          </mask>
+        </defs>
+
+        <rect class="pocket5e-fog-backdrop" x="-1" y="-1" width="9" height="9" fill="#0b0d18" mask="url(#pocket5e-fog-mask)" />
+      </svg>
+      {{/if}}
+
+      <div class="pocket5e-minimap-grid" data-minimap-grid data-debug="{{movementMap.debug}}" role="grid" aria-label="{{localize 'POCKET5E.Movement.MapLabel'}}">
+        {{#each movementMap.cells}}
+        <div class="{{className}}" role="gridcell" aria-label="{{#if player}}{{localize 'POCKET5E.Movement.MapPlayer'}}{{#if occupiedFriendly}}, {{localize 'POCKET5E.Movement.MapOccupiedFriendly'}}{{else if stacked}}, {{localize 'POCKET5E.Movement.MapStacked'}}{{/if}}{{else}}{{#if outside}}{{localize 'POCKET5E.Movement.MapOutside'}}{{else}}{{localize 'POCKET5E.Movement.MapCell'}}{{#if stacked}}, {{localize 'POCKET5E.Movement.MapStacked'}}{{/if}}{{/if}}{{/if}}" data-world-x="{{x}}" data-world-y="{{y}}">
+          <small class="pocket5e-minimap-debug">{{debug}}</small>
+          {{#unless @root.movementMap.wallSegments.length}}
+          {{#unless @root.movementMap.sceneBackground}}
+          {{#if walls.top}}<span class="pocket5e-minimap-wall top" aria-hidden="true"></span>{{/if}}
+          {{#if walls.right}}<span class="pocket5e-minimap-wall right" aria-hidden="true"></span>{{/if}}
+          {{#if walls.bottom}}<span class="pocket5e-minimap-wall bottom" aria-hidden="true"></span>{{/if}}
+          {{#if walls.left}}<span class="pocket5e-minimap-wall left" aria-hidden="true"></span>{{/if}}
+          {{#if windows.top}}<span class="pocket5e-minimap-window top" aria-hidden="true"></span>{{/if}}
+          {{#if windows.right}}<span class="pocket5e-minimap-window right" aria-hidden="true"></span>{{/if}}
+          {{#if windows.bottom}}<span class="pocket5e-minimap-window bottom" aria-hidden="true"></span>{{/if}}
+          {{#if windows.left}}<span class="pocket5e-minimap-window left" aria-hidden="true"></span>{{/if}}
+          {{#if doors.top}}<span class="pocket5e-minimap-door top {{doors.top}}" aria-hidden="true"></span>{{/if}}
+          {{#if doors.right}}<span class="pocket5e-minimap-door right {{doors.right}}" aria-hidden="true"></span>{{/if}}
+          {{#if doors.bottom}}<span class="pocket5e-minimap-door bottom {{doors.bottom}}" aria-hidden="true"></span>{{/if}}
+          {{#if doors.left}}<span class="pocket5e-minimap-door left {{doors.left}}" aria-hidden="true"></span>{{/if}}
+          {{/unless}}
+          {{/unless}}
+          {{#each tokens}}
+          <span class="pocket5e-minimap-token {{kind}}{{#if large}} large{{/if}}{{#if coLocated}} co-located{{/if}}{{#if @root.movementMap.tokenPortraits}}{{#if img}} portrait{{/if}}{{/if}}" style="{{#if large}}--cols: {{cols}}; --rows: {{rows}}; --dx: {{dx}}; --dy: {{dy}}; {{else if coLocated}}--slot: {{slot}}; {{/if}}--token-rot: {{rotation}}deg;" data-token-id="{{id}}" data-token-name="{{name}}" data-token-img="{{img}}" role="img" aria-label="{{label}}" title="{{label}}">{{#if @root.movementMap.tokenPortraits}}{{#if img}}<img src="{{img}}" alt="" aria-hidden="true">{{/if}}{{/if}}</span>
+          {{/each}}
+          {{#if player}}
+          <span class="pocket5e-minimap-token player{{#if @root.movementMap.tokenPortraits}}{{#if @root.movementMap.playerImg}} portrait{{/if}}{{/if}}" style="--token-rot: {{@root.movementMap.playerRotation}}deg;" data-token-id="{{@root.movementMap.playerTokenId}}" role="img" aria-label="{{localize 'POCKET5E.Movement.MapPlayer'}}">{{#if @root.movementMap.tokenPortraits}}{{#if @root.movementMap.playerImg}}<img src="{{@root.movementMap.playerImg}}" alt="" aria-hidden="true">{{/if}}{{/if}}</span>
+          {{/if}}
+        </div>
+        {{/each}}
+      </div>
+      </div>
+      {{#unless movementMap.sceneBackground}}
+      <ul class="pocket5e-minimap-legend" aria-label="{{localize 'POCKET5E.Movement.MapLegend'}}">
+        <li><i class="pocket5e-minimap-swatch wall" aria-hidden="true"></i>{{localize "POCKET5E.Movement.MapLegendWall"}}</li>
+        <li><i class="pocket5e-minimap-swatch window" aria-hidden="true"></i>{{localize "POCKET5E.Movement.MapLegendWindow"}}</li>
+        <li><i class="pocket5e-minimap-swatch closed" aria-hidden="true"></i>{{localize "POCKET5E.Movement.MapLegendDoorClosed"}}</li>
+        <li><i class="pocket5e-minimap-swatch open" aria-hidden="true"></i>{{localize "POCKET5E.Movement.MapLegendDoorOpen"}}</li>
+        <li><i class="pocket5e-minimap-swatch locked" aria-hidden="true"></i>{{localize "POCKET5E.Movement.MapLegendDoorLocked"}}</li>
+        <li><i class="pocket5e-minimap-swatch secret-open" aria-hidden="true"></i>{{localize "POCKET5E.Movement.MapLegendDoorSecret"}}</li>
+      </ul>
+      {{/unless}}
+      {{else}}
+      <p class="pocket5e-minimap-unavailable" role="status">{{localize "POCKET5E.Movement.MapNoToken"}}</p>
+      {{/if}}
+      {{else}}
+      <p class="pocket5e-minimap-unavailable" role="status">{{localize "POCKET5E.Movement.MapUnavailable"}}</p>
+      {{/if}}
+    </div>
+    {{/if}}
+    <div class="pocket5e-movement-pad" role="group" aria-label="{{localize 'POCKET5E.More.Movement'}}">
+      <button type="button" data-action="moveToken" data-direction="nw" aria-label="{{localize 'POCKET5E.Movement.NW'}}"><i class="fa-solid fa-arrow-up-left"></i></button>
+      <button type="button" data-action="moveToken" data-direction="n" aria-label="{{localize 'POCKET5E.Movement.N'}}"><i class="fa-solid fa-arrow-up"></i></button>
+      <button type="button" data-action="moveToken" data-direction="ne" aria-label="{{localize 'POCKET5E.Movement.NE'}}"><i class="fa-solid fa-arrow-up-right"></i></button>
+      <button type="button" data-action="moveToken" data-direction="w" aria-label="{{localize 'POCKET5E.Movement.W'}}"><i class="fa-solid fa-arrow-left"></i></button>
+      <span class="pocket5e-movement-center"><i class="fa-solid fa-person-walking"></i></span>
+      <button type="button" data-action="moveToken" data-direction="e" aria-label="{{localize 'POCKET5E.Movement.E'}}"><i class="fa-solid fa-arrow-right"></i></button>
+      <button type="button" data-action="moveToken" data-direction="sw" aria-label="{{localize 'POCKET5E.Movement.SW'}}"><i class="fa-solid fa-arrow-down-left"></i></button>
+      <button type="button" data-action="moveToken" data-direction="s" aria-label="{{localize 'POCKET5E.Movement.S'}}"><i class="fa-solid fa-arrow-down"></i></button>
+      <button type="button" data-action="moveToken" data-direction="se" aria-label="{{localize 'POCKET5E.Movement.SE'}}"><i class="fa-solid fa-arrow-down-right"></i></button>
+    </div>
+  </div>
+  {{/if}}
+  {{else}}
+  <div class="pocket5e-card pocket5e-placeholder">
+    <i class="fa-solid fa-ellipsis"></i>
+    <p class="pocket5e-muted">{{localize "POCKET5E.More.Pick"}}</p>
+    <div class="pocket5e-btn-grid">
+      {{#each sections}}<button type="button" class="pocket5e-btn" data-action="moreSection" data-section="{{id}}"><i class="{{icon}}"></i>{{label}}</button>{{/each}}
+    </div>
+  </div>
+  {{/if}}
+</section>

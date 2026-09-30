@@ -1,0 +1,817 @@
+/**
+ * GM relay — runs an item/activity use on the GM's client instead of the phone.
+ *
+ * Why: the app loads only the core client and dnd5e, never other modules. midi-qol (and DAE, CPR, animations…)
+ * wraps Activity#use on the client that *starts* the use, so a use started on the phone produces a plain dnd5e card
+ * and midi never sees it. Executed on the GM's client — where those modules live — the full workflow runs: attack and
+ * damage rolls, saves for the targets, damage application, effects.
+ *
+ * Protocol (socket channel "module.<id>", plain game.socket — no socketlib needed for this part):
+ *   phone → { type: "use", v, id, userId, gmId, actorUuid, itemId, activityId|null, targetUuids, advantage,
+ *             disadvantage, rollMode, reaction, awaitCompletion, usage?, dialog? }
+ *   GM    → { type: "useResult", id, ok: true,  stage: "accepted" }   validated, execution started
+ *   GM    → { type: "useResult", id, ok: true,  stage: "done" }       workflow finished (reactions wait for this)
+ *   GM    → { type: "useResult", id, ok: false, stage, error }        rejected, or failed during execution
+ *   phone → { type: "targets", v, id, userId, gmId, actorUuid, itemId?, activityId? }
+ *   phone → { type: "mobile", userId }                 "I am in the app" — see patchMidiPlayerRolls
+ *   GM    → { type: "whoIsMobile" }                     asked once when the GM's client starts
+ *   GM    → { type: "dialog", id, userId, args }        a CPR dialog raised while running that player's use
+ *   phone → { type: "dialogResult", id, result }        its answer, in CPR's own result shape
+ *   GM    → { type: "targetsResult", id, ok, tokens: [{ uuid, name, img, disposition, isSelf, visible, distance,
+ *             range: "normal"|"long"|"out"|null }], units, sceneName, hasObserver }
+ *           — candidates for the target picker, judged on the GM's canvas: what the character's token can see
+ *             (MidiQOL.canSee, else a wall check) and how far / whether within the activity's range
+ *             (MidiQOL.checkActivityRange, else dnd5e range fields against the grid measurement).
+ *   phone → { type: "moveToken", v, id, userId, gmId, actorUuid, direction }
+ *   phone → { type: "moveCancel", v, id, userId, gmId }   (the phone gave up; drop the step if not started yet)
+ *   GM    → { type: "moveResult", id, userId, ok, error? }
+ *   phone → { type: "attack", v, id, userId, gmId, actorUuid, itemId, activityId, targetUuids, advantage,
+ *             disadvantage, fast, rollMode }
+ *   GM    → { type: "attackResult", id, userId, ok, stage?, error? }
+ *   phone → { type: "targetPing", v, userId, gmId, actorUuid, targetUuid }
+ *
+ * Only the designated GM (game.users.activeGM — the same answer on every client) executes, so two GMs never
+ * double-cast. The GM validates ownership, resolves the targets on its own canvas and calls
+ * MidiQOL.completeActivityUse() / completeItemUse() when midi is present, plain dnd5e use with temporary targets
+ * otherwise.
+ *
+ * Both halves live here; main.js registers the GM side in the regular /game client and the client side in the app.
+ * bridge.js builds on this to answer midi-qol's reaction prompts and CPR's remote item rolls from the phone.
+ */
+import { MODULE_ID, SETTINGS, RELAY } from "./settings.js";
+import { rollActivityAttack } from "./actions.js";
+
+export const RELAY_CHANNEL = `module.${MODULE_ID}`;
+export const RELAY_VERSION = 2;
+export const MOVE_DIRECTIONS = Object.freeze({
+  n:  { x: 0, y: -1 }, ne: { x: 1, y: -1 }, e:  { x: 1, y: 0 }, se: { x: 1, y: 1 },
+  s:  { x: 0, y: 1 },  sw: { x: -1, y: 1 }, w:  { x: -1, y: 0 }, nw: { x: -1, y: -1 }
+});
+/** How long the phone waits for the GM to accept a request. */
+const ACCEPT_TIMEOUT_MS = 15_000;
+/** A movement step is short; if the GM has not accepted it by now the phone gives up and cancels it. */
+const MOVE_TIMEOUT_MS = 10_000;
+/**
+ * A step normally finishes well within this and the phone is answered when it does, exactly like before. Only if the
+ * animation hangs (e.g. this browser tab is in the background) is the phone answered after this long anyway.
+ */
+const MOVE_ACCEPT_MS = 4_000;
+/** How long a step waits for the token's previous movement to settle before it starts anyway. */
+const MOVE_SETTLE_MS = 2_000;
+/** How long a caller that asked for completion waits for the workflow to finish (saves, reactions of others…). */
+const COMPLETE_TIMEOUT_MS = 180_000;
+/** How long the GM waits for the player to answer a forwarded CPR dialog before showing it on their own screen. */
+const DIALOG_TIMEOUT_MS = 120_000;
+
+const L = key => game.i18n.localize(key);
+const log = (...args) => console.log(`${MODULE_ID} | relay |`, ...args);
+
+/* -------------------------------------------- */
+/*  Availability                                */
+/* -------------------------------------------- */
+
+export function relayMode() {
+  try { return game.settings.get(MODULE_ID, SETTINGS.RELAY) ?? RELAY.AUTO; } catch(err) { return RELAY.AUTO; }
+}
+
+/** midi-qol is enabled in the world — the phone knows this without loading it (module config travels with the world). */
+export function midiActive() {
+  return game.modules.get("midi-qol")?.active === true;
+}
+
+/** The GM every client agrees on (core picks the same active GM everywhere); null when no GM is connected. */
+export function designatedGM() {
+  return game.users?.activeGM ?? null;
+}
+
+/** Should uses go through the GM at all (setting + midi presence)? Independent of who is online. */
+export function relayEnabled() {
+  const mode = relayMode();
+  if ( mode === RELAY.OFF ) return false;
+  if ( mode === RELAY.ON ) return true;
+  return midiActive();
+}
+
+/** Does this activity want targets picked before it is used? Self/none → no; anything else, or a template → yes. */
+export function needsTargets(activity) {
+  const target = activity?.target;
+  if ( !target ) return false;
+  if ( target.template?.type ) return true;
+  const affects = target.affects?.type;
+  return !!affects && (affects !== "self");
+}
+
+/* -------------------------------------------- */
+/*  Phone side                                  */
+/* -------------------------------------------- */
+
+/** requestId → { resolve, reject, timer, awaitCompletion } */
+const pending = new Map();
+
+export function registerRelayClient() {
+  game.socket.on(RELAY_CHANNEL, onClientMessage);
+  announceMobile();
+  // A GM joining later, or reloading, has no idea who is on a phone until asked — and asks on start.
+  game.socket.on("connect", () => announceMobile());
+}
+
+/** Tell the GM's client that this user is in the app, so roll requests are routed here (patchMidiPlayerRolls). */
+function announceMobile() {
+  game.socket.emit(RELAY_CHANNEL, { type: "mobile", v: RELAY_VERSION, userId: game.user.id });
+}
+
+function onClientMessage(msg) {
+  if ( msg?.type === "whoIsMobile" ) return announceMobile();
+  if ( !["useResult", "targetsResult", "moveResult", "attackResult"].includes(msg?.type) ) return;
+  const entry = pending.get(msg.id);
+  if ( !entry ) {
+    // A failure reported after the request was already answered (the workflow itself broke): just tell the player.
+    if ( (msg.type === "useResult") && (msg.ok === false) && msg.error && (msg.userId === game.user.id) ) ui.notifications.warn(msg.error);
+    return;
+  }
+  if ( !msg.ok ) {
+    settle(msg.id, entry, () => entry.reject(new Error(msg.error || L("POCKET5E.Relay.Failed"))));
+    return;
+  }
+  if ( (msg.stage === "accepted") && entry.awaitCompletion ) {
+    // Keep waiting, but for the workflow now — with the longer budget.
+    clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => settle(msg.id, entry, () => entry.reject(new Error(L("POCKET5E.Relay.CompleteTimeout")))), COMPLETE_TIMEOUT_MS);
+    return;
+  }
+  settle(msg.id, entry, () => entry.resolve(msg));
+}
+
+function settle(id, entry, fn) {
+  clearTimeout(entry.timer);
+  pending.delete(id);
+  fn();
+}
+
+/**
+ * Ask the designated GM to use `activity` (or a whole item) on behalf of this user.
+ * Resolves once the GM has accepted the request — or, with `awaitCompletion`, once the workflow finished.
+ * The chat card arrives through the normal document sync either way.
+ * @param {Activity|null} activity          The activity to use; null with `options.item` for an item-level use.
+ * @param {object} [options]
+ * @param {Item5e} [options.item]           Item to use when no activity is given (midi picks / asks the GM).
+ * @param {string[]} [options.targetUuids]  TokenDocument uuids chosen in the app (may be empty).
+ * @param {boolean} [options.advantage]
+ * @param {boolean} [options.disadvantage]
+ * @param {string} [options.rollMode]       Roll visibility for the created messages.
+ * @param {boolean} [options.reaction]      This use is a reaction (midi flags the workflow, no target confirmation).
+ * @param {boolean} [options.awaitCompletion]
+ * @param {object} [options.usage]          Extra dnd5e/midi usage config merged on the GM (serializable only).
+ * @param {object} [options.dialog]         Extra dialog config merged on the GM.
+ */
+export async function requestUse(activity, { item, targetUuids=[], advantage=false, disadvantage=false, rollMode, reaction=false,
+  awaitCompletion=false, usage, dialog }={}) {
+  const gm = designatedGM();
+  if ( !gm ) throw new Error(L("POCKET5E.Targets.GMRequired"));
+  item ??= activity?.item;
+  const actor = item?.actor;
+  if ( !actor || !item.isEmbedded ) throw new Error(L("POCKET5E.Relay.NotFound"));
+
+  const id = foundry.utils.randomID();
+  const request = {
+    type: "use", v: RELAY_VERSION, id,
+    userId: game.user.id, gmId: gm.id,
+    actorUuid: actor.uuid, itemId: item.id, activityId: activity?.id ?? null,
+    targetUuids: Array.from(targetUuids ?? []),
+    advantage: !!advantage, disadvantage: !!disadvantage,
+    rollMode: rollMode ?? null,
+    reaction: !!reaction, awaitCompletion: !!awaitCompletion
+  };
+  if ( usage && !foundry.utils.isEmpty(usage) ) request.usage = usage;
+  if ( dialog && !foundry.utils.isEmpty(dialog) ) request.dialog = dialog;
+
+  const result = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(game.i18n.format("POCKET5E.Relay.Timeout", { name: gm.name })));
+    }, ACCEPT_TIMEOUT_MS);
+    pending.set(id, { resolve, reject, timer, awaitCompletion: !!awaitCompletion });
+  });
+  log("→", item.name, activity ? (activity.name || activity.type) : "(item)",
+    request.targetUuids.length ? `targets ${request.targetUuids.length}` : "no targets", reaction ? "reaction" : "");
+  game.socket.emit(RELAY_CHANNEL, request);
+  return result;
+}
+
+/**
+ * Ask the designated GM which tokens the character can target right now: visibility and range are judged on the
+ * GM's canvas (the phone has none). Resolves with the reply, or null when no GM / no answer in time.
+ * @param {Actor} actor
+ * @param {Activity|null} [activity]
+ * @param {object} [options]
+ * @param {number} [options.timeoutMs]
+ */
+export async function queryTargets(actor, activity=null, { timeoutMs=4000 }={}) {
+  const gm = designatedGM();
+  if ( !gm || !actor ) return null;
+  const id = foundry.utils.randomID();
+  const request = {
+    type: "targets", v: RELAY_VERSION, id, userId: game.user.id, gmId: gm.id,
+    actorUuid: actor.uuid, itemId: activity?.item?.id ?? null, activityId: activity?.id ?? null
+  };
+  const result = new Promise(resolve => {
+    const timer = setTimeout(() => { pending.delete(id); resolve(null); }, timeoutMs);
+    pending.set(id, { resolve, reject: () => { pending.delete(id); clearTimeout(timer); resolve(null); }, timer, awaitCompletion: false });
+  });
+  game.socket.emit(RELAY_CHANNEL, request);
+  const reply = await result;
+  if ( reply && (reply.ok === false) ) {
+    log("targets query refused:", reply.error);
+    return null;
+  }
+  return reply;
+}
+
+/**
+ * Ask the designated GM to move this actor's token one square-grid step.
+ * @param {Actor} actor
+ * @param {string} direction One of the eight compass directions.
+ */
+export async function requestTokenMove(actor, direction) {
+  const gm = designatedGM();
+  if ( !gm ) throw new Error(L("POCKET5E.Movement.NoGM"));
+  if ( !actor ) throw new Error(L("POCKET5E.Movement.NoToken"));
+  if ( !Object.prototype.hasOwnProperty.call(MOVE_DIRECTIONS, direction) ) throw new Error(L("POCKET5E.Movement.Failed"));
+
+  const id = foundry.utils.randomID();
+  const result = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      // Tell the GM to drop the step if it has not started it yet, so a late step never moves the token after
+      // the player has already given up and pressed something else.
+      game.socket.emit(RELAY_CHANNEL, { type: "moveCancel", v: RELAY_VERSION, id, userId: game.user.id, gmId: gm.id });
+      reject(new Error(game.i18n.format("POCKET5E.Relay.Timeout", { name: gm.name })));
+    }, MOVE_TIMEOUT_MS);
+    pending.set(id, { resolve, reject, timer, awaitCompletion: false });
+  });
+  game.socket.emit(RELAY_CHANNEL, {
+    type: "moveToken", v: RELAY_VERSION, id, userId: game.user.id, gmId: gm.id,
+    actorUuid: actor.uuid, direction
+  });
+  return result;
+}
+
+/** Roll an attack on the GM's client with the selected target temporarily active. */
+export async function requestAttack(activity, { targetUuids=[], advantage=false, disadvantage=false, fast=false, rollMode }={}) {
+  const gm = designatedGM();
+  if ( !gm ) throw new Error(L("POCKET5E.Targets.GMRequired"));
+  const item = activity?.item;
+  const actor = activity?.actor ?? item?.actor;
+  if ( !actor || !item?.isEmbedded || typeof activity?.rollAttack !== "function" ) {
+    throw new Error(L("POCKET5E.Actions.NoAttack"));
+  }
+  if ( targetUuids.length !== 1 ) throw new Error(L("POCKET5E.Targets.Stale"));
+
+  const id = foundry.utils.randomID();
+  const result = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(game.i18n.format("POCKET5E.Relay.Timeout", { name: gm.name })));
+    }, ACCEPT_TIMEOUT_MS);
+    pending.set(id, { resolve, reject, timer, awaitCompletion: true });
+  });
+  game.socket.emit(RELAY_CHANNEL, {
+    type: "attack", v: RELAY_VERSION, id, userId: game.user.id, gmId: gm.id,
+    actorUuid: actor.uuid, itemId: item.id, activityId: activity.id,
+    targetUuids: Array.from(targetUuids), advantage: !!advantage, disadvantage: !!disadvantage,
+    fast: !!fast, rollMode: rollMode ?? null
+  });
+  return result;
+}
+
+/** Show a Foundry ping on a token selected in the phone's target picker. */
+export function requestTargetPing(actor, targetUuid) {
+  const gm = designatedGM();
+  if ( !gm || !actor || !targetUuid ) return;
+  game.socket.emit(RELAY_CHANNEL, {
+    type: "targetPing", v: RELAY_VERSION, userId: game.user.id, gmId: gm.id,
+    actorUuid: actor.uuid, targetUuid
+  });
+}
+
+/* -------------------------------------------- */
+/*  GM side (regular /game client)              */
+/* -------------------------------------------- */
+
+export function registerRelayGM() {
+  if ( !game.user.isGM ) return;
+  game.socket.on(RELAY_CHANNEL, msg => {
+    if ( msg?.type === "use" ) handleUse(msg);
+    else if ( msg?.type === "attack" ) handleAttack(msg);
+    else if ( msg?.type === "targets" ) handleTargets(msg);
+    else if ( msg?.type === "moveToken" ) handleTokenMove(msg);
+    else if ( msg?.type === "moveCancel" ) handleMoveCancel(msg);
+    else if ( msg?.type === "targetPing" ) handleTargetPing(msg);
+    else if ( msg?.type === "dialogResult" ) resolveDialog(msg);
+    else if ( msg?.type === "mobile" ) mobileUsers.add(msg.userId);
+  });
+  Hooks.on("userConnected", (user, connected) => { if ( !connected ) mobileUsers.delete(user.id); });
+  game.socket.emit(RELAY_CHANNEL, { type: "whoIsMobile", v: RELAY_VERSION });
+  patchPremadeDialogs();
+  patchMidiPlayerRolls();
+  log(`GM handler ready (midi-qol ${globalThis.MidiQOL ? "present" : "absent"}`
+    + `, chris-premades ${globalThis.chrisPremades ? "present" : "absent"})`);
+}
+
+/* -------------------------------------------- */
+/*  Roll requests aimed at a player on a phone   */
+/* -------------------------------------------- */
+
+/** Users currently in the app; they announce themselves and are forgotten when they disconnect. */
+const mobileUsers = new Set();
+
+/**
+ * When an NPC forces a save, midi hands the request to whatever the GM configured — Monk's Token Bar, Flash
+ * Rolls, Epic Rolls or its own chat card. None of those modules exist on the phone, so the request lands on the
+ * GM's screen and the player waits for a prompt that never comes.
+ *
+ * Rather than teaching the app each of those modules, the choice is undone for app users only: with the
+ * third-party flags cleared midi falls through to its own `rollAbility` request, which the bridge already
+ * answers with a real dnd5e roll. Everyone else keeps whatever the GM set up.
+ */
+function patchMidiPlayerRolls() {
+  const midi = globalThis.MidiQOL;
+  if ( !midi ) return;
+  // Whichever workflow classes declare the method themselves; subclasses inherit the patched one.
+  const classes = [midi.Workflow, midi.workflowClass, ...Object.values(midi.Workflows ?? {})]
+    .filter(cls => typeof cls === "function");
+  const patchedNames = [];
+  for ( const cls of classes ) {
+    const proto = cls.prototype;
+    if ( !Object.prototype.hasOwnProperty.call(proto ?? {}, "queueTargetSaveRoll") ) continue;
+    if ( proto.queueTargetSaveRoll.pocket5ePatched ) continue;
+    const original = proto.queueTargetSaveRoll;
+    const patched = function(options={}) {
+      const player = options?.playerInfo?.player;
+      if ( player && !player.isGM && mobileUsers.has(player.id) ) {
+        options = {
+          ...options,
+          playerInfo: { ...options.playerInfo, playerChat: false },
+          moduleFlags: { ...(options.moduleFlags ?? {}), playerMonksTB: false, playerFlashTB: false, playerEpicRolls: false },
+          // Midi only shows the roll dialog for its "…with dialog" modes; in the others the player's client rolls
+          // silently. A save that happens without the player touching anything is not what a prompt means, so
+          // the app always gets the dialog and the player presses the button themselves.
+          displayOptions: { ...(options.displayOptions ?? {}), showRollDialog: true }
+        };
+      }
+      return original.call(this, options);
+    };
+    patched.pocket5ePatched = true;
+    proto.queueTargetSaveRoll = patched;
+    patchedNames.push(cls.name || "Workflow");
+  }
+  if ( patchedNames.length ) log(`roll requests for players in the app go through midi's own prompt (${patchedNames.join(", ")})`);
+  else console.warn(`${MODULE_ID} | relay | midi's save dispatch not found — players in the app keep the GM's roll module`);
+}
+
+/* -------------------------------------------- */
+/*  CPR dialogs raised on the GM's screen        */
+/* -------------------------------------------- */
+
+/** requestId → userId, for the relayed uses running right now. */
+const running = new Map();
+/** dialogId → { resolve, timer } for dialogs waiting on a player's answer. */
+const dialogs = new Map();
+const DIALOG_UNANSWERED = Symbol("unanswered");
+
+/**
+ * Whose phone should answer a dialog raised right now? Only when exactly one relayed use is in flight: with two
+ * players casting at once there is no way to tell whose macro is asking, and a question sent to the wrong player
+ * is worse than one shown to the GM.
+ */
+function currentRelayUser() {
+  if ( running.size !== 1 ) return null;
+  const userId = running.values().next().value;
+  return game.users.get(userId)?.active ? userId : null;
+}
+
+/**
+ * Chris's Premades asks its questions on whichever client runs the workflow — with the relay that is the GM, so
+ * a player casting Hex from their phone saw nothing while the GM's screen asked which ability to curse. Every
+ * CPR dialog funnels through chrisPremades.DialogApp.dialog, so while a relayed use is running it is forwarded
+ * to the player who asked for it. Unanswered (or unroutable) dialogs still open on the GM's screen.
+ */
+function patchPremadeDialogs() {
+  const DialogApp = globalThis.chrisPremades?.DialogApp;
+  if ( !DialogApp?.dialog || DialogApp.pocket5ePatched ) return;
+  const original = DialogApp.dialog.bind(DialogApp);
+  DialogApp.dialog = async function(...args) {
+    const userId = currentRelayUser();
+    if ( !userId ) return original(...args);
+    const answer = await askPlayer(userId, args);
+    if ( answer !== DIALOG_UNANSWERED ) return answer;
+    log("player did not answer the dialog — asking here instead");
+    return original(...args);
+  };
+  DialogApp.pocket5ePatched = true;
+  log("chris-premades dialogs are forwarded to the requesting player");
+}
+
+function askPlayer(userId, args) {
+  let payload;
+  try { payload = JSON.parse(JSON.stringify(args)); } catch(err) { return Promise.resolve(DIALOG_UNANSWERED); }
+  const id = foundry.utils.randomID();
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      dialogs.delete(id);
+      resolve(DIALOG_UNANSWERED);
+    }, DIALOG_TIMEOUT_MS);
+    dialogs.set(id, { resolve, timer });
+    game.socket.emit(RELAY_CHANNEL, { type: "dialog", v: RELAY_VERSION, id, userId, args: payload });
+  });
+}
+
+function resolveDialog(msg) {
+  const entry = dialogs.get(msg.id);
+  if ( !entry ) return;                       // already given up on and shown here
+  clearTimeout(entry.timer);
+  dialogs.delete(msg.id);
+  entry.resolve(msg.result ?? null);
+}
+
+/** Is this GM the one that should execute `msg`? The addressee, or the current designated GM if the addressee left. */
+function addressedToMe(msg) {
+  const me = game.user.id;
+  if ( msg.gmId === me ) return true;
+  const addressee = game.users.get(msg.gmId);
+  return (designatedGM()?.id === me) && !addressee?.active;
+}
+
+function handleTargetPing(msg) {
+  try {
+    if ( !addressedToMe(msg) || (msg.v !== RELAY_VERSION) ) return;
+    const user = game.users.get(msg.userId);
+    const actor = resolveActor(msg.actorUuid);
+    if ( !user?.active || !actor?.testUserPermission(user, "OWNER") ) return;
+    if ( !canvas?.ready || !canvas.scene ) return;
+    const [target] = resolveTargets([msg.targetUuid]);
+    if ( !target || target.hidden ) return;
+
+    const observer = canvas.tokens.placeables.find(token =>
+      (token.actor === actor) || (token.document.actorId === actor.id)
+    );
+    if ( observer && (target.object !== observer) ) {
+      const midi = globalThis.MidiQOL;
+      const visible = (typeof midi?.canSee === "function")
+        ? !!midi.canSee(observer, target.object)
+        : hasLineOfSight(observer, target.object);
+      if ( !visible ) return;
+    }
+    canvas.ping(target.object.center, { user });
+  } catch(err) {
+    console.warn(`${MODULE_ID} | relay | target ping failed:`, err);
+  }
+}
+
+async function handleAttack(msg) {
+  const reply = data => game.socket.emit(RELAY_CHANNEL, {
+    type: "attackResult", id: msg.id, userId: msg.userId, ...data
+  });
+  try {
+    if ( !addressedToMe(msg) ) return;
+    if ( msg.v !== RELAY_VERSION ) throw new Error(L("POCKET5E.Movement.Failed"));
+    const user = game.users.get(msg.userId);
+    const actor = resolveActor(msg.actorUuid);
+    if ( !user?.active || !actor?.testUserPermission(user, "OWNER") ) {
+      throw new Error(L("POCKET5E.Relay.Denied"));
+    }
+    const item = actor.items.get(msg.itemId);
+    const activity = item?.system?.activities?.get(msg.activityId);
+    if ( !item || !activity || typeof activity.rollAttack !== "function" ) {
+      throw new Error(L("POCKET5E.Actions.NoAttack"));
+    }
+    if ( !canvas?.ready || !canvas.scene ) throw new Error(L("POCKET5E.Relay.NoScene"));
+    const targets = resolveTargets(msg.targetUuids ?? []);
+    if ( (msg.targetUuids?.length !== 1) || (targets.length !== 1) || targets[0].hidden ) {
+      throw new Error(L("POCKET5E.Targets.Stale"));
+    }
+
+    reply({ ok: true, stage: "accepted" });
+    await withTemporaryTargets(targets, () => rollActivityAttack(activity, {
+      advantage: !!msg.advantage,
+      disadvantage: !!msg.disadvantage,
+      fast: !!msg.fast,
+      rollMode: msg.rollMode ?? undefined,
+      message: { rollMode: msg.rollMode ?? undefined, data: { author: user.id } }
+    }));
+    reply({ ok: true, stage: "done" });
+  } catch(err) {
+    console.warn(`${MODULE_ID} | relay | attack rejected or failed:`, err);
+    reply({ ok: false, error: err?.message ?? String(err) });
+  }
+}
+
+async function handleUse(msg) {
+  if ( !addressedToMe(msg) ) return;
+  const reply = data => game.socket.emit(RELAY_CHANNEL, { type: "useResult", id: msg.id, userId: msg.userId, ...data });
+
+  let item, activity, targets, user;
+  try {
+    if ( msg.v !== RELAY_VERSION ) throw new Error(`relay protocol v${msg.v} ≠ v${RELAY_VERSION} — update the module on both sides`);
+    user = game.users.get(msg.userId);
+    if ( !user ) throw new Error(L("POCKET5E.Relay.Denied"));
+    const actor = resolveActor(msg.actorUuid);
+    if ( !actor?.testUserPermission(user, "OWNER") ) throw new Error(L("POCKET5E.Relay.Denied"));
+    item = actor.items.get(msg.itemId);
+    if ( !item ) throw new Error(L("POCKET5E.Relay.NotFound"));
+    if ( msg.activityId ) {
+      activity = item.system?.activities?.get(msg.activityId);
+      if ( !activity ) throw new Error(L("POCKET5E.Relay.NotFound"));
+    }
+    targets = resolveTargets(msg.targetUuids ?? []);
+    if ( msg.targetUuids?.length && !targets.length ) throw new Error(L("POCKET5E.Relay.SceneMismatch"));
+  } catch(err) {
+    console.warn(`${MODULE_ID} | relay | rejected:`, err);
+    reply({ ok: false, stage: "rejected", error: err?.message ?? String(err) });
+    return;
+  }
+
+  reply({ ok: true, stage: "accepted" });
+  log("←", user.name, msg.reaction ? "reacts with" : "uses", item.name, activity ? (activity.name || activity.type) : "", targets.map(t => t.name));
+
+  // The card is authored by the player: it shows up as theirs in chat, and roll visibility follows their choice.
+  const message = {
+    rollMode: msg.rollMode || undefined,
+    data: { author: user.id, flags: { [MODULE_ID]: { relay: { userId: user.id, reaction: !!msg.reaction } } } }
+  };
+  // Dialogs would open on the GM's screen — never ask: the player already made those choices on the phone and
+  // they travel in msg.usage (spell slot, consumption, concentration — PLAN.md, phase 10.2).
+  const dialog = foundry.utils.mergeObject({ configure: false }, msg.dialog ?? {});
+
+  try {
+    running.set(msg.id, user.id);   // questions the workflow raises go back to this player (patchPremadeDialogs)
+    if ( globalThis.MidiQOL?.completeActivityUse ) {
+      const usage = foundry.utils.mergeObject(foundry.utils.deepClone(msg.usage ?? {}), {
+        midiOptions: {
+          targetUuids: targets.map(t => t.uuid),
+          ignoreUserTargets: true,            // never mix in whatever the GM happens to have targeted
+          checkGMstatus: false,
+          isReaction: !!msg.reaction,
+          workflowOptions: {
+            advantage: !!msg.advantage,
+            disadvantage: !!msg.disadvantage,
+            autoRollAttack: true,             // the player already pressed "use" — no attack prompt on the GM's screen
+            fastForwardAttack: true,
+            fastForwardDamage: true,          // damage auto-roll itself follows the GM's midi settings
+            targetConfirmation: "none"        // targets were chosen on the phone; no confirmation window for the GM
+          }
+        }
+      }, { overwrite: false });               // a usage config from the requester (CPR) keeps its own midiOptions
+      if ( msg.reaction ) message.systemCard = false;   // as midi's own reaction dialog does
+      if ( activity ) await MidiQOL.completeActivityUse(activity, usage, dialog, message);
+      else await MidiQOL.completeItemUse(item, usage, dialog, message);
+    }
+    else {
+      await withTemporaryTargets(targets, () => activity ? activity.use(msg.usage ?? {}, dialog, message) : item.use(msg.usage ?? {}, dialog, message));
+    }
+    reply({ ok: true, stage: "done" });
+  } catch(err) {
+    console.error(`${MODULE_ID} | relay | use failed:`, err);
+    reply({ ok: false, stage: "failed", error: game.i18n.format("POCKET5E.Relay.Failed", { error: err?.message ?? String(err) }) });
+  } finally {
+    running.delete(msg.id);
+  }
+}
+
+/**
+ * Target candidates for the phone's picker, judged from the character's token on the GM's viewed scene.
+ * Hidden tokens are never listed. Without a token of the character on the scene, everything is listed unjudged.
+ */
+function handleTargets(msg) {
+  if ( !addressedToMe(msg) ) return;
+  const reply = data => game.socket.emit(RELAY_CHANNEL, { type: "targetsResult", id: msg.id, userId: msg.userId, ...data });
+  try {
+    const user = game.users.get(msg.userId);
+    const actor = resolveActor(msg.actorUuid);
+    if ( !user || !actor?.testUserPermission(user, "OWNER") ) throw new Error(L("POCKET5E.Relay.Denied"));
+    if ( !canvas?.ready || !canvas.scene ) throw new Error(L("POCKET5E.Relay.NoScene"));
+    const item = msg.itemId ? actor.items.get(msg.itemId) : null;
+    const activity = (item && msg.activityId) ? (item.system?.activities?.get(msg.activityId) ?? null) : null;
+    const observer = canvas.tokens.placeables.find(t => (t.actor === actor) || (t.document.actorId === actor.id)) ?? null;
+    const midi = globalThis.MidiQOL;
+
+    const tokens = [];
+    for ( const t of canvas.tokens.placeables ) {
+      if ( t.document.hidden ) continue;
+      const isSelf = t === observer;
+      let visible = true, distance = null, range = null;
+      if ( observer && !isSelf ) {
+        visible = (typeof midi?.canSee === "function") ? !!midi.canSee(observer, t) : hasLineOfSight(observer, t);
+        distance = (typeof midi?.computeDistance === "function")
+          ? midi.computeDistance(observer, t, { wallsBlock: false })
+          : canvas.grid.measurePath([observer.center, t.center]).distance;
+        if ( activity && visible ) range = rangeClass(activity, observer, t, midi);
+      }
+      tokens.push({
+        uuid: t.document.uuid, name: playerFacingName(t), img: t.document.texture?.src ?? null,
+        disposition: t.document.disposition, isSelf, visible,
+        distance: Number.isFinite(distance) && (distance >= 0) ? Math.round(distance * 10) / 10 : null,
+        range
+      });
+    }
+    // Players know scenes by their navigation name; the real title may spoil ("Ambush at the bridge").
+    const sceneName = canvas.scene.navName || canvas.scene.name;
+    reply({ ok: true, sceneName, units: canvas.scene.grid.units || "", hasObserver: !!observer, tokens });
+  } catch(err) {
+    console.warn(`${MODULE_ID} | relay | targets query rejected:`, err);
+    reply({ ok: false, error: err?.message ?? String(err) });
+  }
+}
+
+/** Per-actor chain of steps, so they run strictly in the order the phone sent them. */
+const moveQueues = new Map();
+/** Request ids already handled / cancelled (kept for a minute): a repeated or cancelled request never moves twice. */
+const handledMoves = new Set();
+const cancelledMoves = new Set();
+function remember(set, id) {
+  set.add(id);
+  setTimeout(() => set.delete(id), 60_000);
+}
+
+function handleTokenMove(msg) {
+  if ( !addressedToMe(msg) ) return;
+  if ( handledMoves.has(msg.id) ) return;
+  remember(handledMoves, msg.id);
+  const key = msg.actorUuid;
+  const run = (moveQueues.get(key) ?? Promise.resolve()).then(() => executeTokenMove(msg));
+  moveQueues.set(key, run);
+  run.finally(() => { if ( moveQueues.get(key) === run ) moveQueues.delete(key); });
+}
+
+function handleMoveCancel(msg) {
+  if ( !addressedToMe(msg) ) return;
+  remember(cancelledMoves, msg.id);
+}
+
+/** Never rejects: every outcome is reported to the phone. */
+async function executeTokenMove(msg) {
+  const reply = data => game.socket.emit(RELAY_CHANNEL, {
+    type: "moveResult", id: msg.id, userId: msg.userId, ...data
+  });
+  try {
+    if ( cancelledMoves.has(msg.id) ) return log("move cancelled before it started:", msg.direction);
+    if ( msg.v !== RELAY_VERSION ) throw new Error(L("POCKET5E.Movement.Failed"));
+    const user = game.users.get(msg.userId);
+    const actor = resolveActor(msg.actorUuid);
+    if ( !user?.active || !actor?.testUserPermission(user, "OWNER") ) {
+      throw new Error(L("POCKET5E.Relay.Denied"));
+    }
+    if ( !Object.prototype.hasOwnProperty.call(MOVE_DIRECTIONS, msg.direction) ) throw new Error(L("POCKET5E.Movement.Failed"));
+    if ( !canvas?.ready || !canvas.scene ) throw new Error(L("POCKET5E.Relay.NoScene"));
+    if ( canvas.grid.type !== CONST.GRID_TYPES.SQUARE ) throw new Error(L("POCKET5E.Movement.SquareGridOnly"));
+
+    const tokens = canvas.tokens.placeables.filter(token => token.document.actorId === actor.id);
+    if ( !tokens.length ) throw new Error(L("POCKET5E.Movement.NoToken"));
+    if ( tokens.length > 1 ) throw new Error(L("POCKET5E.Movement.MultipleTokens"));
+
+    const token = tokens[0];
+    const step = MOVE_DIRECTIONS[msg.direction];
+    const gridSize = canvas.grid.size;
+    // Never build on a position that is about to change: let the token's previous movement settle first, but not
+    // for long (its promise can stay pending for good, e.g. while this browser tab is in the background).
+    await Promise.race([
+      Promise.resolve(token.document.movement?.finished).catch(() => null),
+      new Promise(resolve => setTimeout(resolve, MOVE_SETTLE_MS))
+    ]);
+    // Always start from the token's real, current position; nothing is remembered between steps.
+    const base = { x: token.document.x, y: token.document.y };
+    const wanted = { x: base.x + step.x * gridSize, y: base.y + step.y * gridSize };
+    const { x, y } = token.document.getSnappedPosition?.(wanted) ?? wanted;
+    log(`move ${msg.direction} [${msg.id}]: (${base.x}, ${base.y}) → (${x}, ${y})`);
+
+    if ( typeof token.document.move === "function" ) {
+      // move() resolves only when the animation has finished, which may never happen while this browser tab is in
+      // the background; after MOVE_ACCEPT_MS the phone is answered anyway.
+      const outcome = (async () => token.document.move({ x, y, snapped: true, explicit: true }, {
+        method: "keyboard", showRuler: true
+      }))().catch(err => {
+        console.warn(`${MODULE_ID} | relay | token movement failed:`, err);
+        return false;
+      });
+      const first = await Promise.race([outcome, new Promise(resolve => setTimeout(() => resolve("started"), MOVE_ACCEPT_MS))]);
+      if ( first === false ) throw new Error(L("POCKET5E.Movement.Prevented"));
+    } else {
+      // Foundry v13 has no TokenDocument movement API; keep its previous one-step behavior.
+      const width = token.document.width * gridSize;
+      const height = token.document.height * gridSize;
+      if ( x < 0 || y < 0 || (x + width) > canvas.scene.width || (y + height) > canvas.scene.height ) {
+        throw new Error(L("POCKET5E.Movement.SceneEdge"));
+      }
+      const destination = { x: token.center.x + step.x * gridSize, y: token.center.y + step.y * gridSize };
+      const moveBackend = CONFIG.Canvas?.polygonBackends?.move;
+      if ( typeof moveBackend?.testCollision !== "function" ) {
+        throw new Error(L("POCKET5E.Movement.CollisionUnavailable"));
+      }
+      if ( moveBackend.testCollision(token.center, destination, { type: "move", mode: "any" }) ) {
+        throw new Error(L("POCKET5E.Movement.Blocked"));
+      }
+      await token.document.update({ x, y });
+    }
+    reply({ ok: true });
+  } catch(err) {
+    console.warn(`${MODULE_ID} | relay | token movement rejected:`, err);
+    reply({ ok: false, error: err?.message ?? String(err) });
+  }
+}
+
+/**
+ * The token's name as the players see it: Hide NPC Names (game.hnn) and Anonymous (module api) replace NPC names
+ * on the canvas and in chat; the picker must not leak the real one. Player-owned actors are never renamed.
+ */
+function playerFacingName(token) {
+  const name = token.document.name;
+  const actor = token.actor;
+  if ( !actor || actor.hasPlayerOwner ) return name;
+  if ( game.modules.get("hide-npc-names")?.active && (typeof game.hnn?.getReplacementInfo === "function") ) {
+    try {
+      const info = game.hnn.getReplacementInfo(actor, name);
+      if ( info?.shouldReplace ) return info.replacementName || name;
+    } catch(err) { /* fall through */ }
+  }
+  const anonymous = game.modules.get("anonymous");
+  if ( anonymous?.active && anonymous.api ) {
+    try {
+      if ( !anonymous.api.playersSeeName(actor) ) return anonymous.api.getName(actor) || name;
+    } catch(err) { /* fall through */ }
+  }
+  return name;
+}
+
+/** Sight-blocking walls between two token centres (the vanilla stand-in for midi's canSee). */
+function hasLineOfSight(a, b) {
+  const backend = CONFIG.Canvas?.polygonBackends?.sight;
+  if ( typeof backend?.testCollision !== "function" ) return true;
+  try { return !backend.testCollision(a.center, b.center, { type: "sight", mode: "any" }); }
+  catch(err) { return true; }
+}
+
+/**
+ * "normal" | "long" (disadvantage range) | "out" | null (the activity has no range to judge). midi's own check
+ * when present — the same verdict the workflow will apply — else dnd5e's range fields against the grid measurement.
+ */
+function rangeClass(activity, observer, target, midi) {
+  if ( typeof midi?.checkActivityRange === "function" ) {
+    try {
+      const result = midi.checkActivityRange(activity, observer, new Set([target]), false)?.result;
+      if ( result === "normal" ) return "normal";
+      if ( result === "dis" ) return "long";
+      if ( result === "fail" ) return "out";
+    } catch(err) { /* fall through to the vanilla check */ }
+  }
+  const rg = activity.range;
+  if ( !rg ) return null;
+  let range = Number(rg.value || rg.reach || 0);
+  let long = Number(rg.long || 0);
+  if ( rg.units === "touch" ) {
+    range = Number(activity.item?.system?.range?.reach) || canvas.dimensions?.distance || 5;
+    long = 0;
+  }
+  if ( !range && !long ) return null;                       // self / any / special / unset
+  if ( long && (long < range) ) long = range;
+  const d = canvas.grid.measurePath([observer.center, target.center]).distance;
+  if ( d <= range ) return "normal";
+  if ( long && (d <= long) ) return "long";
+  return "out";
+}
+
+/** "Actor.X" or a token uuid → the Actor. */
+function resolveActor(uuid) {
+  const doc = fromUuidSync(uuid);
+  if ( !doc ) return null;
+  return doc.documentName === "Actor" ? doc : (doc.actor ?? null);
+}
+
+/**
+ * TokenDocuments for the requested uuids that exist on the GM's *viewed* scene — midi and dnd5e need Token
+ * objects, which only exist for the scene on the canvas. Tokens on other scenes are dropped (the caller reports it).
+ */
+function resolveTargets(uuids) {
+  const out = [];
+  for ( const uuid of uuids ) {
+    const doc = fromUuidSync(uuid);
+    if ( doc?.documentName !== "Token" ) continue;
+    if ( !doc.object || (doc.parent !== canvas?.scene) ) continue;
+    out.push(doc);
+  }
+  return out;
+}
+
+/** Vanilla fallback (no midi): target for the GM while the use runs, then put the GM's own targets back. */
+async function withTemporaryTargets(targets, fn) {
+  const saved = Array.from(game.user.targets ?? []).map(t => t.id);
+  setUserTargets(targets.map(t => t.id));
+  try { return await fn(); }
+  finally { setUserTargets(saved); }
+}
+
+/** Replace the local user's targets by token id — TokenLayer#setTargets (v13/v14), with the User-side updater as a guard. */
+function setUserTargets(ids) {
+  if ( typeof canvas?.tokens?.setTargets === "function" ) return canvas.tokens.setTargets(ids);
+  game.user._onUpdateTokenTargets?.(ids);
+  game.user.broadcastActivity?.({ targets: ids });
+}
